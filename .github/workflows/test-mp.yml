@@ -1,0 +1,33 @@
+name: Test MP API
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test users/me
+        env:
+          TOKEN: ${{ secrets.MP_TOKEN }}
+        run: |
+          echo "=== Test 1: users/me con User-Agent Chrome ==="
+          curl -s -w "\n---STATUS: %{http_code}\n" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
+            -H "Accept: application/json" \
+            -H "Accept-Language: es-AR" \
+            https://api.mercadopago.com/users/me | head -c 500
+
+          echo ""
+          echo "=== Test 2: settlement_report search ==="
+          curl -s -w "\n---STATUS: %{http_code}\n" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
+            https://api.mercadopago.com/v1/account/settlement_report/search | head -c 500
+
+          echo ""
+          echo "=== Test 3: settlement_report list ==="
+          curl -s -w "\n---STATUS: %{http_code}\n" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
+            https://api.mercadopago.com/v1/account/settlement_report/list | head -c 500
