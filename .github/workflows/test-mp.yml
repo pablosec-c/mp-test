@@ -1,35 +1,29 @@
-name: Test MP Download
+name: Sync MP → Supabase
+
 on:
+  # Corre solo cada día a las 6:00 AM Argentina (9:00 UTC)
+  schedule:
+    - cron: '0 9 * * *'
+  # También se puede correr a mano desde la pestaña Actions
   workflow_dispatch:
 
 jobs:
-  test:
+  sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Test descarga del último reporte
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar dependencias
+        run: npm install xlsx@0.18.5
+
+      - name: Sync MP → Supabase
         env:
-          TOKEN: ${{ secrets.MP_TOKEN }}
-        run: |
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-
-          echo "=== Paso 1: obtener el file_name del último reporte ==="
-          FILE_NAME=$(curl -s \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "User-Agent: $UA" \
-            "https://api.mercadopago.com/v1/account/settlement_report/list" \
-            | grep -o '"file_name":"[^"]*"' | head -1 | cut -d'"' -f4)
-          echo "file_name = $FILE_NAME"
-
-          echo ""
-          echo "=== Paso 2: descargar el archivo ==="
-          curl -s -w "STATUS: %{http_code} | SIZE: %{size_download} bytes\n" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "User-Agent: $UA" \
-            -o reporte.xlsx \
-            "https://api.mercadopago.com/v1/account/settlement_report/$FILE_NAME"
-
-          echo ""
-          echo "=== Paso 3: chequear archivo bajado ==="
-          ls -la reporte.xlsx
-          file reporte.xlsx
-          head -c 200 reporte.xlsx | xxd | head -5
+          MP_TOKEN: ${{ secrets.MP_TOKEN }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: node sync-mp.js
