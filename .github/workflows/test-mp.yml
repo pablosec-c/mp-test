@@ -1,4 +1,4 @@
-name: Test MP API
+name: Test MP Download
 on:
   workflow_dispatch:
 
@@ -6,28 +6,30 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Test users/me
+      - name: Test descarga del último reporte
         env:
           TOKEN: ${{ secrets.MP_TOKEN }}
         run: |
-          echo "=== Test 1: users/me con User-Agent Chrome ==="
-          curl -s -w "\n---STATUS: %{http_code}\n" \
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+          echo "=== Paso 1: obtener el file_name del último reporte ==="
+          FILE_NAME=$(curl -s \
             -H "Authorization: Bearer $TOKEN" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
-            -H "Accept: application/json" \
-            -H "Accept-Language: es-AR" \
-            https://api.mercadopago.com/users/me | head -c 500
+            -H "User-Agent: $UA" \
+            "https://api.mercadopago.com/v1/account/settlement_report/list" \
+            | grep -o '"file_name":"[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "file_name = $FILE_NAME"
 
           echo ""
-          echo "=== Test 2: settlement_report search ==="
-          curl -s -w "\n---STATUS: %{http_code}\n" \
+          echo "=== Paso 2: descargar el archivo ==="
+          curl -s -w "STATUS: %{http_code} | SIZE: %{size_download} bytes\n" \
             -H "Authorization: Bearer $TOKEN" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
-            https://api.mercadopago.com/v1/account/settlement_report/search | head -c 500
+            -H "User-Agent: $UA" \
+            -o reporte.xlsx \
+            "https://api.mercadopago.com/v1/account/settlement_report/$FILE_NAME"
 
           echo ""
-          echo "=== Test 3: settlement_report list ==="
-          curl -s -w "\n---STATUS: %{http_code}\n" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
-            https://api.mercadopago.com/v1/account/settlement_report/list | head -c 500
+          echo "=== Paso 3: chequear archivo bajado ==="
+          ls -la reporte.xlsx
+          file reporte.xlsx
+          head -c 200 reporte.xlsx | xxd | head -5
