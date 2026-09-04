@@ -1,22 +1,23 @@
 /**********************************************************************
- *  SYNC MERCADO PAGO (Take 15) → SUPABASE
+ *  SYNC MERCADO PAGO (Take 15) → SUPABASE (tabla LEDGER, doble entrada)
  *  Corre automático cada día desde GitHub Actions.
  *
  *  Flujo:
  *   1. Lista los reportes de MP y agarra el más nuevo procesado
  *   2. Lo descarga (xlsx)
  *   3. Lee cada movimiento y aplica las 5 reglas + memoria
- *   4. Chequea duplicados (mp_payment_id)
- *   5. Inserta los nuevos en Supabase como "pendiente_categorizar"
+ *   4. Chequea duplicados contra LEDGER (mp_payment_id)
+ *   5. Inserta los nuevos en LEDGER como 2 filas por movimiento
+ *      (line_type='cuenta' + line_type='categoria', mismo entry_id,
+ *       montos opuestos → suma cero, como exige el constraint)
  **********************************************************************/
 
 const XLSX = require('xlsx');
+const crypto = require('crypto');
 
 // ===== CONSTANTES =====
 const SUPABASE_URL = 'https://kqngnjbtkddkhiahcsdo.supabase.co';
 const ACCOUNT_ID_TAKE15 = '45af468c-d87e-44d6-a86a-b809a77456ba';
-const TYPE_INGRESO = '7f38e08e-5d25-45b7-a58b-07e70fe8474c';   // Cobranza Cliente (provisorio)
-const TYPE_EGRESO = '6670f68b-41dc-4de1-9a41-ffa1e4d178d4';    // Transferencia (provisorio)
 const MI_CUIT = '20406633587';
 
 // Columnas del Excel de MP (0-based)
@@ -48,13 +49,31 @@ async function descargarReporte(fileName) {
   return Buffer.from(await r.arrayBuffer());
 }
 
-// ===== SUPABASE: mp_payment_id ya importados =====
+// ===== SUPABASE: mp_payment_id ya importados (en LEDGER) =====
 async function getExistentes() {
-  const url = `${SUPABASE_URL}/rest/v1/transactions?select=mp_payment_id&origen_mp=eq.true&account_id=eq.${ACCOUNT_ID_TAKE15}&mp_payment_id=not.is.null`;
-  const r = await fetch(url, { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
-  if (!r.ok) throw new Error(`Error consultando existentes: ${r.status}`);
-  const arr = await r.json();
-  return new Set(arr.map((x) => String(x.mp_payment_id)));
+  // Ahora consulta LEDGER (fuente única de verdad), no la tabla vieja transactions.
+  // Trae solo las filas de tipo 'cuenta' porque ahí guardamos el mp_payment_id.
+  // Paginación por si hay más de 1000 filas.
+  const existentes = new Set();
+  let from = 0;
+  const CHUNK = 1000;
+  while (true) {
+    const url = `${SUPABASE_URL}/rest/v1/ledger?select=mp_payment_id&line_type=eq.cuenta&origen_mp=eq.true&account_id=eq.${ACCOUNT_ID_TAKE15}&mp_payment_id=not.is.null`;
+    const r = await fetch(url, {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        Range: `${from}-${from + CHUNK - 1}`,
+        'Range-Unit': 'items',
+      },
+    });
+    if (!r.ok) throw new Error(`Error consultando existentes: ${r.status} ${await r.text()}`);
+    const arr = await r.json();
+    arr.forEach((x) => existentes.add(String(x.mp_payment_id)));
+    if (arr.length < CHUNK) break;
+    from += CHUNK;
+  }
+  return existentes;
 }
 
 // ===== SUPABASE: memoria de destinatarios =====
@@ -87,17 +106,18 @@ function clasificar(r, memoria) {
   if (tipoOp.toUpperCase().includes('PAYOUT')) return { categoria: 'Traspaso', subcategoria: 'Traspaso a Banco Francés', provider_id: null };
   // R2: mi propio CUIT saliendo → retiro personal
   if (cuit === MI_CUIT && valor < 0) return { categoria: 'Personales', subcategoria: 'Pablo Seco', provider_id: null };
-  // Memoria
-  const k = norm(pagador);
-  if (k && memoria[k]) {
-    const m = memoria[k];
-    return { categoria: m.categoria, subcategoria: m.subcategoria, provider_id: m.provider_id };
+  // Memoria (busca por nombre/CUIT/CBU normalizado)
+  for (const k of [norm(cuit), norm(pagador)]) {
+    if (k && memoria[k]) {
+      const m = memoria[k];
+      return { categoria: m.categoria, subcategoria: m.subcategoria, provider_id: m.provider_id };
+    }
   }
   // R3: rendimientos
   if (valor > 0 && tipoMedio === '' && liquidado === 'false') return { categoria: 'Financiero', subcategoria: 'Rendimientos', provider_id: null };
-  // R4: entra plata sin match
+  // R4: entra plata sin match → cobranza
   if (valor > 0) return { categoria: 'Cobranzas clientes', subcategoria: null, provider_id: null };
-  // R5: sale sin match
+  // R5: sale sin match → queda sin categoría, admin decide
   return { categoria: null, subcategoria: null, provider_id: null };
 }
 
@@ -110,9 +130,9 @@ function armarDesc(r) {
   return d;
 }
 
-// ===== SUPABASE: insertar lote =====
-async function insertar(lote) {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/transactions`, {
+// ===== SUPABASE: insertar lote de LÍNEAS en LEDGER =====
+async function insertarLineas(lineas) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/ledger`, {
     method: 'POST',
     headers: {
       apikey: SUPABASE_KEY,
@@ -120,14 +140,65 @@ async function insertar(lote) {
       'Content-Type': 'application/json',
       Prefer: 'return=minimal',
     },
-    body: JSON.stringify(lote),
+    body: JSON.stringify(lineas),
   });
   if (!r.ok) throw new Error(`Error insertando: ${r.status} ${await r.text()}`);
 }
 
+// Arma las 2 líneas de ledger para un movimiento MP
+function armarLineas(row, clasif) {
+  const entryId = crypto.randomUUID();
+  const fecha = String(row[COL.FECHA]).slice(0, 10);
+  const valor = parseFloat(row[COL.VALOR]) || 0;   // signo lo pone MP, no lo tocamos
+  const desc = armarDesc(row);
+  const mpId = String(row[COL.ID]).trim();
+  const pagador = String(row[COL.PAGADOR] || '').trim() || null;
+
+  // Subcategoría que va en la línea de CUENTA (por consistencia con lo que hay en la BD):
+  // - si hay subcategoria clasificada → esa
+  // - si no, si es ingreso con pagador → nombre del pagador
+  // - si no → null
+  const subCuenta = clasif.subcategoria || (valor > 0 ? pagador : null);
+
+  return [
+    // Línea de CUENTA: lleva el account_id, el signo real, el mp_payment_id y el estado_revision
+    {
+      entry_id: entryId,
+      line_type: 'cuenta',
+      account_id: ACCOUNT_ID_TAKE15,
+      categoria: null,
+      subcategoria: subCuenta,
+      descripcion: desc,
+      monto: valor,                            // signed (+ ingreso, − egreso)
+      fecha,
+      mp_payment_id: mpId,
+      origen_mp: true,
+      estado_revision: 'pendiente_categorizar',
+      cliente: valor > 0 ? pagador : null,
+      provider_id: clasif.provider_id,
+    },
+    // Línea de CATEGORÍA: monto opuesto para que sume cero (doble entrada)
+    {
+      entry_id: entryId,
+      line_type: 'categoria',
+      account_id: null,
+      categoria: clasif.categoria,             // puede ser null → queda pendiente
+      subcategoria: clasif.subcategoria,
+      descripcion: desc,
+      monto: -valor,                           // signo opuesto
+      fecha,
+      mp_payment_id: null,
+      origen_mp: false,
+      estado_revision: null,
+      cliente: valor > 0 ? pagador : null,
+      provider_id: clasif.provider_id,
+    },
+  ];
+}
+
 // ===== MAIN =====
 (async () => {
-  console.log('=== INICIO sync MP → Supabase ===');
+  console.log('=== INICIO sync MP → Supabase (LEDGER) ===');
 
   // 1. Buscar el reporte más nuevo procesado
   const reportes = await listarReportes();
@@ -150,48 +221,50 @@ async function insertar(lote) {
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1 }).slice(1); // saltar headers
   console.log(`✅ Excel leído: ${rows.length} filas`);
 
-  // 4. Cargar existentes + memoria
+  // 4. Cargar existentes (de LEDGER) + memoria
   const [existentes, memoria] = await Promise.all([getExistentes(), getMemoria()]);
-  console.log(`   Ya importados: ${existentes.size} | Destinatarios en memoria: ${Object.keys(memoria).length}`);
+  console.log(`   Ya en ledger: ${existentes.size} | Destinatarios en memoria: ${Object.keys(memoria).length}`);
 
-  // 5. Armar movimientos nuevos
-  const nuevos = [];
+  // 5. Armar líneas (2 por movimiento nuevo)
+  let lineasParaInsertar = [];
+  let contNuevos = 0;
+  let contDupIntraArchivo = 0;
+  const vistosEnEsteArchivo = new Set();
+
   for (const r of rows) {
     const mpId = String(r[COL.ID] || '').trim();
     if (!mpId) continue;
     if (existentes.has(mpId)) continue;
+    // Dedupe también dentro del mismo archivo (por si MP repite filas)
+    if (vistosEnEsteArchivo.has(mpId)) { contDupIntraArchivo++; continue; }
+    vistosEnEsteArchivo.add(mpId);
+
     const valor = parseFloat(r[COL.VALOR]) || 0;
     if (valor === 0) continue;
 
     const c = clasificar(r, memoria);
-    nuevos.push({
-      transaction_date: String(r[COL.FECHA]).slice(0, 10),
-      amount: Math.abs(valor),
-      description: armarDesc(r),
-      account_id: ACCOUNT_ID_TAKE15,
-      transaction_type_id: valor >= 0 ? TYPE_INGRESO : TYPE_EGRESO,
-      categoria: null,
-      categoria_sugerida: c.categoria,
-      subcategoria: c.subcategoria,
-      provider_id: c.provider_id,
-      cliente: valor >= 0 ? String(r[COL.PAGADOR] || '') || null : null,
-      mp_payment_id: mpId,
-      origen_mp: true,
-      estado_revision: 'pendiente_categorizar',
-    });
+    const [linCuenta, linCat] = armarLineas(r, c);
+    lineasParaInsertar.push(linCuenta, linCat);
+    contNuevos++;
   }
-  console.log(`✅ Movimientos NUEVOS a importar: ${nuevos.length}`);
+  console.log(`✅ Movimientos NUEVOS a importar: ${contNuevos} (= ${lineasParaInsertar.length} líneas en ledger)`);
+  if (contDupIntraArchivo > 0) console.log(`   (Ignorados por repetirse dentro del mismo archivo: ${contDupIntraArchivo})`);
 
-  if (nuevos.length === 0) {
+  if (lineasParaInsertar.length === 0) {
     console.log('=== FIN: nada nuevo ===');
     return;
   }
 
-  // 6. Insertar en lotes de 100
-  for (let i = 0; i < nuevos.length; i += 100) {
-    await insertar(nuevos.slice(i, i + 100));
+  // 6. Insertar en lotes de 200 LÍNEAS (= 100 movimientos por lote)
+  //    Importante: los pares (cuenta+categoria) del mismo entry_id
+  //    van siempre juntos, porque los generamos consecutivos y usamos
+  //    tamaño de lote par. Así el constraint AFTER de "suma cero por
+  //    entry_id" nunca falla por lote cortado a la mitad.
+  const BATCH = 200;
+  for (let i = 0; i < lineasParaInsertar.length; i += BATCH) {
+    await insertarLineas(lineasParaInsertar.slice(i, i + BATCH));
   }
-  console.log(`✅ IMPORTADOS: ${nuevos.length} movimientos como PENDIENTES (badge NUEVO azul)`);
+  console.log(`✅ IMPORTADOS: ${contNuevos} movimientos como PENDIENTES (badge REVISAR)`);
   console.log('=== FIN sync MP ===');
 })().catch((e) => {
   console.error('❌ ERROR:', e.message);
